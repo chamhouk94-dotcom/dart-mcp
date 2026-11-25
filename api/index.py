@@ -876,3 +876,168 @@ class handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
+
+import io as _io
+import re as _re
+import html as _html
+import zipfile as _zipfile
+
+_DOC_CACHE = {}
+
+
+def _doc_download(rcept_no: str):
+    """공시서류원본파일(document.xml) 다운로드 → [(파일명, xml문자열), ...]"""
+    if rcept_no in _DOC_CACHE:
+        return _DOC_CACHE[rcept_no]
+    key = __import__("os").environ.get("OPENDART_API_KEY", "")
+    query = urllib.parse.urlencode({"crtfc_key": key, "rcept_no": rcept_no})
+    with urllib.request.urlopen(f"{BASE_URL}/document.xml?{query}", timeout=60) as r:
+        raw = r.read()
+    if not raw.startswith(b"PK"):  # zip이 아니면 오류 응답
+        msg = raw.decode("utf-8", "ignore")
+        m = _re.search(r"<message>(.*?)</message>", msg, _re.S)
+        raise Exception("OpenDART 오류: " + (m.group(1).strip() if m else msg[:300]))
+    files = []
+    with _zipfile.ZipFile(_io.BytesIO(raw)) as z:
+        for name in sorted(z.namelist()):
+            data = z.read(name)
+            for enc in ("utf-8", "cp949"):
+                try:
+                    text = data.decode(enc)
+                    break
+                except UnicodeDecodeError:
+                    text = None
+            files.append((name, text if text is not None else data.decode("utf-8", "ignore")))
+    if len(_DOC_CACHE) > 5:
+        _DOC_CACHE.clear()
+    _DOC_CACHE[rcept_no] = files
+    return files
+
+
+def _doc_to_text(xml: str) -> str:
+    """XML 태그를 걷어내고 읽을 수 있는 글로 변환 (표는 | 로 구분)"""
+    t = _re.sub(r"<(TD|TE|TU|TH)\b[^>]*>", " | ", xml, flags=_re.I)
+    t = _re.sub(r"</?(TR|P|BR|TITLE|TABLE|SECTION-\d)\b[^>]*>", "\n", t, flags=_re.I)
+    t = _re.sub(r"<[^>]+>", "", t)
+    t = _html.unescape(t).replace("\xa0", " ")
+    t = _re.sub(r"[ \t]+", " ", t)
+    t = _re.sub(r"\n\s*\n+", "\n", t)
+    return t.strip()
+
+
+def _doc_sections(rcept_no: str):
+    """문서를 제목(TITLE) 단위로 나눈 목록"""
+    sections = []
+    for fname, xml in _doc_download(rcept_no):
+        marks = []
+        level = 1
+        for m in _re.finditer(r"<SECTION-(\d)|<TITLE\b[^>]*>(.*?)</TITLE>", xml, _re.S | _re.I):
+            if m.group(1):
+                level = int(m.group(1))
+            else:
+                title = _doc_to_text(m.group(2)).replace("\n", " ").strip()
+                if title:
+                    marks.append((m.start(), title, level))
+        if not marks:
+            marks = [(0, fname, 1)]
+        for i, (pos, title, lvl) in enumerate(marks):
+            end = marks[i + 1][0] if i + 1 < len(marks) else len(xml)
+            start = 0 if i == 0 else pos
+            sections.append({"file": fname, "title": title, "level": lvl, "xml": xml[start:end]})
+    return sections
+
+
+def get_document_toc(rcept_no: str) -> dict:
+    secs = _doc_sections(rcept_no)
+    toc = []
+    for i, s in enumerate(secs):
+        toc.append({
+            "no": i,
+            "title": ("  " * (s["level"] - 1)) + s["title"],
+            "chars": len(_doc_to_text(s["xml"])),
+            "file": s["file"],
+        })
+    return {
+        "rcept_no": rcept_no,
+        "section_count": len(toc),
+        "toc": toc,
+        "next_step": "get_document_section에 no(번호) 또는 제목 일부를 넣어 본문을 읽으세요.",
+    }
+
+
+def get_document_section(rcept_no: str, section, offset: int = 0, max_chars: int = 20000) -> dict:
+    secs = _doc_sections(rcept_no)
+    idx = None
+    if isinstance(section, int) or str(section).strip().isdigit():
+        idx = int(section)
+    else:
+        key = str(section).replace(" ", "")
+        for i, s in enumerate(secs):
+            if key in s["title"].replace(" ", ""):
+                idx = i
+                break
+    if idx is None or not (0 <= idx < len(secs)):
+        return {"error": f"'{section}'에 해당하는 장을 찾지 못했습니다. get_document_toc로 목차를 먼저 확인하세요."}
+    text = _doc_to_text(secs[idx]["xml"])
+    offset = max(0, int(offset or 0))
+    max_chars = min(max(1000, int(max_chars or 20000)), 40000)
+    chunk = text[offset:offset + max_chars]
+    nxt = offset + max_chars if offset + max_chars < len(text) else None
+    return {
+        "rcept_no": rcept_no,
+        "no": idx,
+        "title": secs[idx]["title"],
+        "total_chars": len(text),
+        "offset": offset,
+        "next_offset": nxt,
+        "text": chunk,
+        "source_url": f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rcept_no}",
+    }
+
+
+_ORIG_GET_TOOLS = get_tools
+_ORIG_CALL_TOOL = call_tool
+
+
+def get_tools():
+    return _ORIG_GET_TOOLS() + [
+        {
+            "name": "get_document_toc",
+            "description": "공시 본문 목차 조회. 공시 접수번호(rcept_no, search_disclosures 결과)를 넣으면 "
+                           "본문을 장·절 단위로 나눈 목차(번호, 제목, 글자수)를 준다. 본문은 get_document_section으로 읽는다.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"rcept_no": {"type": "string", "description": "공시 접수번호 14자리"}},
+                "required": ["rcept_no"],
+            },
+        },
+        {
+            "name": "get_document_section",
+            "description": "공시 본문 중 한 장(절)의 글을 읽는다. section에 목차 번호(no) 또는 제목 일부"
+                           "(예: '재무제표 주석', '사업의 내용')를 넣는다. 길면 next_offset으로 이어 읽는다.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "rcept_no": {"type": "string", "description": "공시 접수번호 14자리"},
+                    "section": {"type": "string", "description": "목차 번호 또는 제목 일부"},
+                    "offset": {"type": "integer", "description": "이어 읽을 시작 위치 (기본 0)"},
+                    "max_chars": {"type": "integer", "description": "한 번에 가져올 글자수 (기본 20000, 최대 40000)"},
+                },
+                "required": ["rcept_no", "section"],
+            },
+        },
+    ]
+
+
+def call_tool(name: str, arguments: dict) -> dict:
+    try:
+        if name == "get_document_toc":
+            return get_document_toc(arguments["rcept_no"])
+        if name == "get_document_section":
+            return get_document_section(
+                arguments["rcept_no"], arguments["section"],
+                arguments.get("offset", 0), arguments.get("max_chars", 20000),
+            )
+    except Exception as e:
+        return {"error": str(e)}
+    return _ORIG_CALL_TOOL(name, arguments)
