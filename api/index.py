@@ -8,7 +8,7 @@ import urllib.parse
 
 
 # API 키 설정 (공용)
-API_KEY = "d64dadc7b8236e0ae2e6c3560ef400cc12f2c705"
+API_KEY = __import__("os").environ.get("OPENDART_API_KEY", "")
 BASE_URL = "https://opendart.fss.or.kr/api"
 
 # AI 컨텍스트용 상세 안내
